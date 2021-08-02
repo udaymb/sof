@@ -20,11 +20,11 @@ if length(bf.steer_az) ~= length(bf.steer_el)
 	error('The steer_az and steer_el lengths need to be equal.');
 end
 
-if length(find(bf.steer_az > 180)) || length(find(bf.steer_az < -180))
+if ~isempty(find(bf.steer_az > 180, 1)) || ~isempty(find(bf.steer_az < -180, 1))
 	error('The steer_az angles need to be -180 to +180 degrees');
 end
 
-if length(find(bf.steer_el > 90)) || length(find(bf.steer_el < -90))
+if ~isempty(find(bf.steer_el > 90, 1)) || ~isempty(find(bf.steer_el < -90, 1))
 	error('The steer_el angles need to be -90 to +90 degrees');
 end
 
@@ -102,7 +102,11 @@ n_phi = length(phi_rad);
 steer_az = bf.steer_az*pi/180;
 steer_el = bf.steer_el*pi/180;
 mu = ones(1,N_half) * 10^(bf.mu_db/20);
-
+% select below
+% 0=def;1=svd;
+DEBUG_DIAG_LOAD_ON    = 1;  % 0= default
+% 0=def;1=hann;2=hamming;3=taylorwin;4=chebwin;
+DEBUG_SELT_FILT_ON    = 1;  % 0= default
 %% Source at distance r
 [src_x, src_y, src_z] = source_xyz(bf.steer_r, steer_az, steer_el);
 
@@ -119,6 +123,10 @@ for n=1:bf.num_filters
 			+(bf.mic_y(n) - bf.mic_y(m))^2 ...
 			+(bf.mic_z(n) - bf.mic_z(m))^2);
             Gamma_vv(:,n,m) = sinc(2*pi*f*lnm/bf.c);
+		if isequal(DEBUG_DIAG_LOAD_ON,1)
+			% singular value decomposition
+			Gamma_vv(:,n,m) = svd(sinc(2*pi*f*lnm/bf.c), 'econ');
+		end
     end
 end
 
@@ -189,6 +197,18 @@ for i=N_half+1:N
 end
 
 win = kaiser(bf.fir_length,bf.fir_beta);
+if isequal(DEBUG_SELT_FILT_ON,1)
+    win = hann (bf.fir_length);
+elseif isequal(DEBUG_SELT_FILT_ON,2)
+    win = hamming(bf.fir_length);
+elseif isequal(DEBUG_SELT_FILT_ON,3)
+    sidelobe = -30;
+    nbar = 4;
+    win = taylorwin(bf.fir_length, nbar, sidelobe);
+elseif isequal(DEBUG_SELT_FILT_ON,4)
+    sidelobe = 30;
+    win = chebwin(bf.fir_length, sidelobe);
+end
 bf.w = zeros(bf.fir_length, bf.num_filters);
 w_tmp = zeros(N, bf.num_filters);
 idx_max = zeros(bf.num_filters, 1);
@@ -246,6 +266,9 @@ for iw = 1:N_half
     denom2 = denom1 * W_w;
     di = num / denom2;
     bf.di_db(iw) = 10*log10(abs(di));
+    if isequal(DEBUG_DIAG_LOAD_ON,1)
+        bf.di_db(iw) = log(abs(di)*fs/N)*1e+1/3;
+    end
 end
 
 
@@ -259,6 +282,9 @@ for iw = 1:N_half
     denom = W_wh * W_w;
     wng = num / denom2;
     wng_db(iw) = 10*log10(abs(wng));
+    if isequal(DEBUG_DIAG_LOAD_ON,1)
+        wng_db(iw) = log(abs(wng)*fs/N)*1e+1/3;
+    end
 end
 bf.wng_db = wng_db;
 
@@ -505,7 +531,7 @@ end
 
 function myaudiowrite(fn, x, fs)
 [~, ~, ext] = fileparts(fn);
-if strcmp(lower(ext), '.raw')
+if strcmpi(ext, '.raw')
 	s = size(x);
 	xq = zeros(s(1) * s(2), 1, 'int16');
 	scale = 2^15;
