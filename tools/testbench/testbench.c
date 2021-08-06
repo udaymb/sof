@@ -57,6 +57,12 @@ struct shared_lib_table lib_table[NUM_WIDGETS_SUPPORTED] = {
 /* compatible variables, not used */
 intptr_t _comp_init_start, _comp_init_end;
 
+struct cache_context hc = {0};
+
+/* cache debugger */
+struct cache_context *host_cache = &hc;
+int _elem_id = 0;
+
 /*
  * Parse output filenames from user input
  * This function takes in the output filenames as an input in the format:
@@ -140,12 +146,13 @@ static void print_usage(char *executable)
 	printf("-o <output_file1,output_file2,...> ");
 	printf("-t <tplg_file> -b <input_format> -c <channels>");
 	printf("-a <comp1=comp1_library,comp2=comp2_library>\n");
-	printf("input_format should be S16_LE, S32_LE, S24_LE or FLOAT_LE\n");
+	printf("   input_format should be S16_LE, S32_LE, S24_LE or FLOAT_LE\n\n");
 	printf("Example Usage:\n");
 	printf("%s -i in.txt -o out.txt -t test.tplg ", executable);
-	printf("-r 48000 -R 96000 -c 2");
-	printf("-b S16_LE -a vol=libsof_volume.so\n");
+	printf("-r 48000 -R 96000 -c 2 ");
+	printf("-b S16_LE -a volume=libsof_volume.so\n");
 	printf("-C number of copy() iterations\n");
+	printf("-P number of dynamic pipeline iterations\n");
 }
 
 /* free components */
@@ -171,12 +178,12 @@ static void free_comps(void)
 	}
 }
 
-static void parse_input_args(int argc, char **argv, struct testbench_prm *tp)
+static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 {
 	int option = 0;
 	int ret = 0;
 
-	while ((option = getopt(argc, argv, "hdi:o:t:b:a:r:R:c:C:")) != -1) {
+	while ((option = getopt(argc, argv, "hdi:o:t:b:a:r:R:c:C:P:V")) != -1) {
 		switch (option) {
 		/* input sample file */
 		case 'i':
@@ -230,33 +237,209 @@ static void parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 			tp->copy_check = true;
 			break;
 
+		/* number of dynamic pipeline iterations */
+		case 'P':
+			tp->dynamic_pipeline_iterations = atoi(optarg);
+			break;
+
+		/* number of virtual cores */
+		case 'V':
+			tp->num_vcores = atoi(optarg);
+			break;
+
 		/* print usage */
 		default:
 			fprintf(stderr, "unknown option %c\n", option);
+			ret = -EINVAL;
 			__attribute__ ((fallthrough));
 		case 'h':
 			print_usage(argv[0]);
-			exit(EXIT_FAILURE);
+			return ret;
 		}
 
 		if (ret < 0)
-			exit(EXIT_FAILURE);
+			return ret;
 	}
+
+	return ret;
 }
 
-int main(int argc, char **argv)
+struct pipeline_thread_data {
+	struct testbench_prm *tp;
+	int count;			/* copy iteration count */
+	int core_id;
+};
+
+static int pipline_load_run(struct pipeline_thread_data *ptd)
 {
-	struct testbench_prm tp;
+	struct testbench_prm *tp = ptd->tp;
+	struct tplg_context ctx;
+	int count = ptd->count;
 	struct ipc_comp_dev *pcm_dev;
 	struct pipeline *p;
 	struct pipeline *curr_p;
 	struct comp_dev *cd;
 	struct file_comp_data *frcd, *fwcd;
-	char pipeline[DEBUG_MSG_LEN];
 	clock_t tic, toc;
 	double c_realtime, t_exec;
 	int n_in, n_out, ret;
-	int i;
+	int i, copy_count = tp->copy_iterations;
+
+	/* setup the thread virtual core config */
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.comp_id = 1000 * ptd->core_id;
+	ctx.core_id = ptd->core_id;
+	ctx.file = tp->file;
+	ctx.sof = sof_get();
+	ctx.tp = tp;
+	ctx.tplg_file = tp->tplg_file;
+
+	/* print test summary */
+	printf("==========================================================\n");
+	printf("		           Test Start %d\n", count);
+	printf("==========================================================\n");
+
+	/* parse topology file and create pipeline */
+	if (parse_topology(&ctx) < 0) {
+		fprintf(stderr, "error: parsing topology\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Get pointer to filewrite */
+	pcm_dev = ipc_get_comp_by_id(sof_get()->ipc, tp->fw_id);
+	if (!pcm_dev) {
+		fprintf(stderr, "error: failed to get pointers to filewrite\n");
+		exit(EXIT_FAILURE);
+	}
+	fwcd = comp_get_drvdata(pcm_dev->cd);
+
+	/* Get pointer to fileread */
+	pcm_dev = ipc_get_comp_by_id(sof_get()->ipc, tp->fr_id);
+	if (!pcm_dev) {
+		fprintf(stderr, "error: failed to get pointers to fileread\n");
+		exit(EXIT_FAILURE);
+	}
+	frcd = comp_get_drvdata(pcm_dev->cd);
+
+	/* Run pipeline until EOF from fileread */
+	pcm_dev = ipc_get_comp_by_id(sof_get()->ipc, tp->sched_id);
+	p = pcm_dev->cd->pipeline;
+
+	/* input and output sample rate */
+	if (!tp->fs_in)
+		tp->fs_in = p->period * p->frames_per_sched;
+
+	if (!tp->fs_out)
+		tp->fs_out = p->period * p->frames_per_sched;
+
+	/* set pipeline params and trigger start */
+	if (tb_pipeline_start(sof_get()->ipc, p, tp) < 0) {
+		fprintf(stderr, "error: pipeline params\n");
+		free_comps();
+		return -EINVAL;
+	}
+
+	cd = pcm_dev->cd;
+	tb_enable_trace(false); /* reduce trace output */
+	tic = clock();
+
+	while (frcd->fs.reached_eof == 0) {
+		/*
+		 * Schedule copy for all pipelines which have the same schedule
+		 * component as the working one.
+		 *
+		 * In common convention pipelines are added with monotonic
+		 * increasing IDs started from 1, we could take care of it in
+		 * test topologies so this for-loop will walk all pipelines.
+		 */
+		for (i = 1; i <= tp->max_pipeline_id; i++) {
+			pcm_dev = ipc_get_comp_by_ppl_id(sof_get()->ipc,
+							 COMP_TYPE_PIPELINE, i);
+			if (pcm_dev) {
+				curr_p = pcm_dev->pipeline;
+				if (pipeline_is_same_sched_comp(p, curr_p))
+					pipeline_schedule_copy(curr_p, 0);
+			}
+		}
+
+		/* are we bailing out after a fixed number of iterations ? */
+		if (tp->copy_check) {
+			if (--copy_count == 0)
+				break;
+		}
+	}
+
+	if (!frcd->fs.reached_eof && !tp->copy_check)
+		printf("warning: possible pipeline xrun\n");
+
+	/* reset and free pipeline */
+	toc = clock();
+	tb_enable_trace(true);
+	pipeline_trigger(p, cd, COMP_TRIGGER_STOP);
+	ret = pipeline_reset(p, cd);
+	if (ret < 0) {
+		fprintf(stderr, "error: pipeline reset\n");
+		exit(EXIT_FAILURE);
+	}
+
+	n_in = frcd->fs.n;
+	n_out = fwcd->fs.n;
+	t_exec = (double)(toc - tic) / CLOCKS_PER_SEC;
+	c_realtime = (double)n_out / tp->channels / tp->fs_out / t_exec;
+
+	/* print test summary */
+	printf("==========================================================\n");
+	printf("		           Test Summary %d\n", count);
+	printf("==========================================================\n");
+	printf("Test Pipeline:\n");
+	printf("%s\n", tp->pipeline_string);
+	printf("Input bit format: %s\n", tp->bits_in);
+	printf("Input sample rate: %d\n", tp->fs_in);
+	printf("Output sample rate: %d\n", tp->fs_out);
+	for (i = 0; i < tp->output_file_num; i++) {
+		printf("Output[%d] written to file: \"%s\"\n",
+		       i, tp->output_file[i]);
+	}
+	printf("Input sample count: %d\n", n_in);
+	printf("Output sample count: %d\n", n_out);
+	printf("Total execution time: %.2f us, %.2f x realtime\n\n",
+	       1e3 * t_exec, c_realtime);
+
+	/* free all components/buffers in pipeline */
+	free_comps();
+
+	return 0;
+}
+
+static void *pipline_thread(void *data)
+{
+	struct pipeline_thread_data *ptd = data;
+	struct testbench_prm *tp = ptd->tp;
+	int dp_count = 0;
+	int err;
+
+	/* build, run and teardown pipelines */
+	while (dp_count < tp->dynamic_pipeline_iterations) {
+		fprintf(stdout, "pipeline run %d/%d\n", ++dp_count,
+			tp->dynamic_pipeline_iterations);
+
+		err = pipline_load_run(ptd);
+		if (err < 0) {
+			fprintf(stderr, "error: pipeline run %d failed %d\n",
+				dp_count, err);
+			break;
+		}
+		ptd->count++;
+	}
+
+	return NULL;
+}
+
+int main(int argc, char **argv)
+{
+	struct testbench_prm tp;
+	struct pipeline_thread_data ptd[CACHE_VCORE_COUNT];
+	int i, err;
 
 	/* initialize input and output sample rates, files, etc. */
 	tp.fs_in = 0;
@@ -270,9 +453,14 @@ int main(int argc, char **argv)
 	tp.channels = TESTBENCH_NCH;
 	tp.max_pipeline_id = 0;
 	tp.copy_check = false;
+	tp.dynamic_pipeline_iterations = 1;
+	tp.num_vcores = 0;
+	tp.pipeline_string = calloc(1, DEBUG_MSG_LEN);
 
 	/* command line arguments*/
-	parse_input_args(argc, argv, &tp);
+	err = parse_input_args(argc, argv, &tp);
+	if (err < 0)
+		goto out;
 
 	/* check mandatory args */
 	if (!tp.tplg_file) {
@@ -299,135 +487,55 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
+	if (tp.num_vcores > CACHE_VCORE_COUNT) {
+		fprintf(stderr, "virtual core count %d is greater than max %d\n",
+				tp.num_vcores, CACHE_VCORE_COUNT);
+		print_usage(argv[0]);
+		exit(EXIT_FAILURE);
+	} else if (!tp.num_vcores)
+		tp.num_vcores = 1;
+
 	/* initialize ipc and scheduler */
 	if (tb_pipeline_setup(sof_get()) < 0) {
 		fprintf(stderr, "error: pipeline init\n");
 		exit(EXIT_FAILURE);
 	}
 
-	/* parse topology file and create pipeline */
-	if (parse_topology(sof_get(), &tp, pipeline) < 0) {
-		fprintf(stderr, "error: parsing topology\n");
-		exit(EXIT_FAILURE);
+	/* build, run and teardown pipelines */
+	for (i = 0; i < tp.num_vcores; i++) {
+		ptd[i].core_id = i;
+		ptd[i].tp = &tp;
+		ptd[i].count = 0;
+		err = pthread_create(&hc.thread_id[i], NULL,
+				pipline_thread, &ptd[i]);
 	}
 
-	/* Get pointer to filewrite */
-	pcm_dev = ipc_get_comp_by_id(sof_get()->ipc, tp.fw_id);
-	if (!pcm_dev) {
-		fprintf(stderr, "error: failed to get pointers to filewrite\n");
-		exit(EXIT_FAILURE);
+	/* wait for all threads to complete */
+	for (i = 0; i < tp.num_vcores; i++) {
+		if (hc.thread_id[i])
+			err = pthread_join(hc.thread_id[i], NULL);
 	}
-	fwcd = comp_get_drvdata(pcm_dev->cd);
-
-	/* Get pointer to fileread */
-	pcm_dev = ipc_get_comp_by_id(sof_get()->ipc, tp.fr_id);
-	if (!pcm_dev) {
-		fprintf(stderr, "error: failed to get pointers to fileread\n");
-		exit(EXIT_FAILURE);
-	}
-	frcd = comp_get_drvdata(pcm_dev->cd);
-
-	/* Run pipeline until EOF from fileread */
-	pcm_dev = ipc_get_comp_by_id(sof_get()->ipc, tp.sched_id);
-	p = pcm_dev->cd->pipeline;
-
-	/* input and output sample rate */
-	if (!tp.fs_in)
-		tp.fs_in = p->period * p->frames_per_sched;
-
-	if (!tp.fs_out)
-		tp.fs_out = p->period * p->frames_per_sched;
-
-	/* set pipeline params and trigger start */
-	if (tb_pipeline_start(sof_get()->ipc, p, &tp) < 0) {
-		fprintf(stderr, "error: pipeline params\n");
-		exit(EXIT_FAILURE);
-	}
-
-	cd = pcm_dev->cd;
-	tb_enable_trace(false); /* reduce trace output */
-	tic = clock();
-
-	while (frcd->fs.reached_eof == 0) {
-		/*
-		 * Schedule copy for all pipelines which have the same schedule
-		 * component as the working one.
-		 *
-		 * In common convention pipelines are added with monotonic
-		 * increasing IDs started from 1, we could take care of it in
-		 * test topologies so this for-loop will walk all pipelines.
-		 */
-		for (i = 1; i <= tp.max_pipeline_id; i++) {
-			pcm_dev = ipc_get_comp_by_ppl_id(sof_get()->ipc,
-							 COMP_TYPE_PIPELINE, i);
-			if (pcm_dev) {
-				curr_p = pcm_dev->pipeline;
-				if (pipeline_is_same_sched_comp(p, curr_p))
-					pipeline_schedule_copy(curr_p, 0);
-			}
-		}
-
-		/* are we bailing out after a fixed number of iterations ? */
-		if (tp.copy_check) {
-			if (--tp.copy_iterations == 0)
-				break;
-		}
-	}
-
-	if (!frcd->fs.reached_eof && !tp.copy_check)
-		printf("warning: possible pipeline xrun\n");
-
-	/* reset and free pipeline */
-	toc = clock();
-	tb_enable_trace(true);
-	pipeline_trigger(p, cd, COMP_TRIGGER_STOP);
-	ret = pipeline_reset(p, cd);
-	if (ret < 0) {
-		fprintf(stderr, "error: pipeline reset\n");
-		exit(EXIT_FAILURE);
-	}
-
-	n_in = frcd->fs.n;
-	n_out = fwcd->fs.n;
-	t_exec = (double)(toc - tic) / CLOCKS_PER_SEC;
-	c_realtime = (double)n_out / tp.channels / tp.fs_out / t_exec;
-
-	/* print test summary */
-	printf("==========================================================\n");
-	printf("		           Test Summary\n");
-	printf("==========================================================\n");
-	printf("Test Pipeline:\n");
-	printf("%s\n", pipeline);
-	printf("Input bit format: %s\n", tp.bits_in);
-	printf("Input sample rate: %d\n", tp.fs_in);
-	printf("Output sample rate: %d\n", tp.fs_out);
-	for (i = 0; i < tp.output_file_num; i++) {
-		printf("Output[%d] written to file: \"%s\"\n",
-		       i, tp.output_file[i]);
-	}
-	printf("Input sample count: %d\n", n_in);
-	printf("Output sample count: %d\n", n_out);
-	printf("Total execution time: %.2f us, %.2f x realtime\n",
-	       1e3 * t_exec, c_realtime);
-
-	/* free all components/buffers in pipeline */
-	free_comps();
 
 	/* free other core FW services */
 	tb_pipeline_free(sof_get());
 
+out:
 	/* free all other data */
 	free(tp.bits_in);
 	free(tp.input_file);
 	free(tp.tplg_file);
 	for (i = 0; i < tp.output_file_num; i++)
 		free(tp.output_file[i]);
+	free(tp.pipeline_string);
+
+	_cache_free_all();
 
 	/* close shared library objects */
 	for (i = 0; i < NUM_WIDGETS_SUPPORTED; i++) {
 		if (lib_table[i].handle)
 			dlclose(lib_table[i].handle);
 	}
+
 
 	return EXIT_SUCCESS;
 }

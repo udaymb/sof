@@ -18,6 +18,8 @@
 #define SOF_DEV 1
 #define FUZZER_DEV 2
 
+struct testbench_prm;
+
 struct comp_info {
 	char *name;
 	int id;
@@ -28,6 +30,33 @@ struct comp_info {
 struct frame_types {
 	char *name;
 	enum sof_ipc_frame frame;
+};
+
+struct sof;
+
+struct tplg_context {
+	/* info array */
+	struct comp_info *info;		/* comp info array */
+	int info_elems;
+	int info_index;
+
+	/* pipeline and core IDs we are processing */
+	int pipeline_id;
+	int core_id;
+
+	/* current IPC object and widget */
+	struct snd_soc_tplg_hdr *hdr;
+	struct snd_soc_tplg_dapm_widget *widget;
+	int comp_id;
+	size_t widget_size;
+	int dev_type;
+	int sched_id;
+
+	/* global data */
+	FILE *file;
+	struct testbench_prm *tp;
+	struct sof *sof;
+	const char *tplg_file;
 };
 
 static const struct frame_types sof_frames[] = {
@@ -255,6 +284,7 @@ int tplg_load_graph(int num_comps, int pipeline_id,
 		    int route_num, int count);
 
 int load_pga(void *dev, int comp_id, int pipeline_id,
+		 struct testbench_prm *tp,
 	     struct snd_soc_tplg_dapm_widget *widget);
 
 int load_aif_in_out(void *dev, int comp_id, int pipeline_id,
@@ -262,21 +292,19 @@ int load_aif_in_out(void *dev, int comp_id, int pipeline_id,
 int load_dai_in_out(void *dev, int comp_id, int pipeline_id,
 		    struct snd_soc_tplg_dapm_widget *widget, int dir, void *tp);
 int load_buffer(void *dev, int comp_id, int pipeline_id,
+		struct testbench_prm *tp,
 		struct snd_soc_tplg_dapm_widget *widget);
 int load_pipeline(void *dev, int comp_id, int pipeline_id,
 		  struct snd_soc_tplg_dapm_widget *widget,
-		  int sched_id);
+		  int sched_id,  struct testbench_prm *tp);
 int load_src(void *dev, int comp_id, int pipeline_id,
-	     struct snd_soc_tplg_dapm_widget *widget, void *params);
+	     struct snd_soc_tplg_dapm_widget *widget, void *params,  struct testbench_prm *tp);
 int load_asrc(void *dev, int comp_id, int pipeline_id,
-	      struct snd_soc_tplg_dapm_widget *widget, void *params);
+	      struct snd_soc_tplg_dapm_widget *widget, void *params,  struct testbench_prm *tp);
 int load_mixer(void *dev, int comp_id, int pipeline_id,
-	       struct snd_soc_tplg_dapm_widget *widget);
-int load_process(void *dev, int comp_id, int pipeline_id,
-		 struct snd_soc_tplg_dapm_widget *widget);
-int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
-		int comp_id, int comp_index, int pipeline_id, void *tp,
-		int *sched_id, FILE *file);
+	       struct snd_soc_tplg_dapm_widget *widget,  struct testbench_prm *tp);
+int load_process(struct tplg_context *ctx);
+int load_widget(struct tplg_context *ctx);
 
 void register_comp(int comp_type, struct sof_ipc_comp_ext *comp_ext);
 int find_widget(struct comp_info *temp_comp_list, int count, char *name);

@@ -1188,6 +1188,7 @@ int tplg_load_graph(int num_comps, int pipeline_id,
 
 	/* look up component id from the component list */
 	for (j = 0; j < num_comps; j++) {
+
 		if (strcmp(temp_comp_list[j].name,
 			   graph_elem->source) == 0) {
 			connection->source_id = temp_comp_list[j].id;
@@ -1223,14 +1224,22 @@ int tplg_load_graph(int num_comps, int pipeline_id,
 }
 
 /* load dapm widget */
-int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
+int load_widget(struct tplg_context *ctx)
+/*void *dev, int dev_type, struct comp_info *temp_comp_list,
 		int comp_id, int comp_index, int pipeline_id,
-		void *tp, int *sched_id, FILE *file)
+		void *tp, int *sched_id, FILE *file) */
 {
-	struct snd_soc_tplg_dapm_widget *widget;
-	size_t read_size;
-	size_t size;
+	//struct snd_soc_tplg_dapm_widget *widget = NULL;
+	struct comp_info *temp_comp_list = ctx->info;
+	int comp_index = ctx->info_index;
+	int comp_id = ctx->comp_id;
 	int ret = 0;
+
+	// tmp hack
+	void *dev = ctx->sof;
+	int dev_type = ctx->dev_type;
+	int pipeline_id = ctx->pipeline_id;
+	void *tp = ctx->tp;
 
 	if (!temp_comp_list) {
 		fprintf(stderr, "load_widget: temp_comp_list argument NULL\n");
@@ -1238,16 +1247,15 @@ int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
 	}
 
 	/* allocate memory for widget */
-	size = sizeof(struct snd_soc_tplg_dapm_widget);
-	widget = (struct snd_soc_tplg_dapm_widget *)malloc(size);
-	if (!widget) {
+	ctx->widget_size = sizeof(struct snd_soc_tplg_dapm_widget);
+	ctx->widget = malloc(ctx->widget_size);
+	if (!ctx->widget) {
 		fprintf(stderr, "error: mem alloc\n");
 		return -errno;
 	}
 
 	/* read widget data */
-	read_size = sizeof(struct snd_soc_tplg_dapm_widget);
-	ret = fread(widget, read_size, 1, file);
+	ret = fread(ctx->widget, ctx->widget_size, 1, ctx->file);
 	if (ret != 1) {
 		ret = -EINVAL;
 		goto exit;
@@ -1259,26 +1267,26 @@ int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
 	 * which will be used for setting up component connections
 	 */
 	temp_comp_list[comp_index].id = comp_id;
-	temp_comp_list[comp_index].name = strdup(widget->name);
-	temp_comp_list[comp_index].type = widget->id;
-	temp_comp_list[comp_index].pipeline_id = pipeline_id;
+	temp_comp_list[comp_index].name = strdup(ctx->widget->name);
+	temp_comp_list[comp_index].type = ctx->widget->id;
+	temp_comp_list[comp_index].pipeline_id = ctx->pipeline_id;
 
 	printf("debug: loading comp_id %d: widget %s id %d\n",
-	       comp_id, widget->name, widget->id);
+	       comp_id, ctx->widget->name, ctx->widget->id);
 
 	/* load widget based on type */
-	switch (widget->id) {
+	switch (ctx->widget->id) {
 
 	/* load pga widget */
 	case(SND_SOC_TPLG_DAPM_PGA):
-		if (load_pga(dev, comp_id, pipeline_id, widget) < 0) {
+		if (load_pga(dev, comp_id, pipeline_id, tp, ctx->widget) < 0) {
 			fprintf(stderr, "error: load pga\n");
 			ret = -EINVAL;
 			goto exit;
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_AIF_IN):
-		if (load_aif_in_out(dev, comp_id, pipeline_id, widget,
+		if (load_aif_in_out(dev, comp_id, pipeline_id, ctx->widget,
 				    SOF_IPC_STREAM_PLAYBACK, tp) < 0) {
 			fprintf(stderr, "error: load AIF IN failed\n");
 			ret = -EINVAL;
@@ -1286,7 +1294,7 @@ int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_AIF_OUT):
-		if (load_aif_in_out(dev, comp_id, pipeline_id, widget,
+		if (load_aif_in_out(dev, comp_id, pipeline_id, ctx->widget,
 				    SOF_IPC_STREAM_CAPTURE, tp) < 0) {
 			fprintf(stderr, "error: load AIF OUT failed\n");
 			ret = -EINVAL;
@@ -1294,7 +1302,7 @@ int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_DAI_IN):
-		if (load_dai_in_out(dev, comp_id, pipeline_id, widget,
+		if (load_dai_in_out(dev, comp_id, pipeline_id, ctx->widget,
 				    SOF_IPC_STREAM_PLAYBACK, tp) < 0) {
 			fprintf(stderr, "error: load filewrite\n");
 			ret = -EINVAL;
@@ -1302,7 +1310,7 @@ int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_DAI_OUT):
-		if (load_dai_in_out(dev, comp_id, pipeline_id, widget,
+		if (load_dai_in_out(dev, comp_id, pipeline_id, ctx->widget,
 				    SOF_IPC_STREAM_CAPTURE, tp) < 0) {
 			fprintf(stderr, "error: load filewrite\n");
 			ret = -EINVAL;
@@ -1310,7 +1318,7 @@ int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_BUFFER):
-		if (load_buffer(dev, comp_id, pipeline_id, widget) < 0) {
+		if (load_buffer(dev, comp_id, pipeline_id, tp, ctx->widget) < 0) {
 			fprintf(stderr, "error: load buffer\n");
 			ret = -EINVAL;
 			goto exit;
@@ -1319,39 +1327,39 @@ int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
 	case(SND_SOC_TPLG_DAPM_SCHEDULER):
 		/* find comp id for scheduling comp */
 		if (dev_type == FUZZER_DEV)
-			*sched_id = find_widget(temp_comp_list, comp_id,
-						widget->sname);
+			ctx->sched_id = find_widget(temp_comp_list, comp_id,
+					ctx->widget->sname);
 
-		if (load_pipeline(dev, comp_id, pipeline_id, widget,
-				  *sched_id) < 0) {
+		if (load_pipeline(dev, comp_id, pipeline_id, ctx->widget,
+				  ctx->sched_id, tp) < 0) {
 			fprintf(stderr, "error: load pipeline\n");
 			ret = -EINVAL;
 			goto exit;
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_SRC):
-		if (load_src(dev, comp_id, pipeline_id, widget, tp) < 0) {
+		if (load_src(dev, comp_id, pipeline_id, ctx->widget, tp, tp) < 0) {
 			fprintf(stderr, "error: load src\n");
 			ret = -EINVAL;
 			goto exit;
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_ASRC):
-		if (load_asrc(dev, comp_id, pipeline_id, widget, tp) < 0) {
+		if (load_asrc(dev, comp_id, pipeline_id, ctx->widget, tp, tp) < 0) {
 			fprintf(stderr, "error: load src\n");
 			ret = -EINVAL;
 			goto exit;
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_MIXER):
-		if (load_mixer(dev, comp_id, pipeline_id, widget) < 0) {
+		if (load_mixer(dev, comp_id, pipeline_id, ctx->widget, tp) < 0) {
 			fprintf(stderr, "error: load mixer\n");
 			ret = -EINVAL;
 			goto exit;
 		}
 		break;
 	case(SND_SOC_TPLG_DAPM_EFFECT):
-		if (load_process(dev, comp_id, pipeline_id, widget) < 0) {
+		if (load_process(ctx) < 0) {
 			fprintf(stderr, "error: load effect\n");
 			ret = -EINVAL;
 			goto exit;
@@ -1359,26 +1367,27 @@ int load_widget(void *dev, int dev_type, struct comp_info *temp_comp_list,
 		break;
 	/* unsupported widgets */
 	default:
-		if (fseek(file, widget->priv.size, SEEK_CUR)) {
+		if (fseek(ctx->file, ctx->widget->priv.size, SEEK_CUR)) {
 			fprintf(stderr, "error: fseek unsupported widget\n");
 			ret = -errno;
 			goto exit;
 		}
 
-		printf("info: Widget type not supported %d\n", widget->id);
-		ret = tplg_load_controls(widget->num_kcontrols, file);
+		printf("info: Widget type not supported %d\n", ctx->widget->id);
+		ret = tplg_load_controls(ctx->widget->num_kcontrols, ctx->file);
 		if (ret < 0) {
 			fprintf(stderr, "error: loading controls\n");
 			goto exit;
 		}
+		ret = 0;
 		break;
 	}
 
-	ret = 0;
+	ret = 1;
 
 exit:
 	/* free allocated widget data */
-	free(widget);
+	free(ctx->widget);
 	return ret;
 }
 
